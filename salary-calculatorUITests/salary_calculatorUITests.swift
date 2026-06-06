@@ -2,42 +2,51 @@
 //  salary_calculatorUITests.swift
 //  salary-calculatorUITests
 //
-//  Created by panbo on 2025/3/14.
-//
 
 import XCTest
 
 final class salary_calculatorUITests: XCTestCase {
 
     override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-
-        // In UI tests it is usually best to stop immediately when a failure occurs.
         continueAfterFailure = false
-
-        // In UI tests it’s important to set the initial state - such as interface orientation - required for your tests before they run. The setUp method is a good place to do this.
     }
 
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-    }
-
+    /// 走完引导页 → 进入主界面 → 截图，验证实时工资界面正常渲染。
     @MainActor
-    func testExample() throws {
-        // UI tests must launch the application that they test.
+    func testOnboardingToEarnings() throws {
         let app = XCUIApplication()
+        app.launchArguments += ["-resetOnboarding"]
         app.launch()
 
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-    }
-
-    @MainActor
-    func testLaunchPerformance() throws {
-        if #available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 7.0, *) {
-            // This measures how long it takes to launch your application.
-            measure(metrics: [XCTApplicationLaunchMetric()]) {
-                XCUIApplication().launch()
+        // 走完引导页（最多 5 次点击「下一步」/「开始使用」）
+        for _ in 0..<5 {
+            let next = app.buttons["下一步"]
+            let start = app.buttons["开始使用"]
+            if start.exists && start.isHittable {
+                start.tap()
+                break
+            } else if next.exists && next.isHittable {
+                next.tap()
+            } else {
+                break
             }
         }
+
+        // 进入主界面后应能看到「今日收入」标题
+        let todayLabel = app.staticTexts["今日收入"]
+        XCTAssertTrue(todayLabel.waitForExistence(timeout: 5), "主界面应显示今日收入")
+
+        // 截两张图（间隔便于人工核对数字是否变化）
+        attachScreenshot(app, name: "earnings-1")
+        Thread.sleep(forTimeInterval: 2.5)
+        attachScreenshot(app, name: "earnings-2")
+    }
+
+    private func attachScreenshot(_ app: XCUIApplication, name: String) {
+        let shot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: shot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 }

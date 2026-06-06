@@ -3,159 +3,59 @@ import SwiftData
 
 @main
 struct SalaryApp: App {
-    @StateObject private var appState = AppState()
-    
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(appState)
-                .task {
-                    // 初始化应用
-                    await appState.initialize()
-                }
+            RootView()
         }
         .modelContainer(for: [SalaryConfig.self, HolidayConfig.self])
     }
 }
 
-class AppState: ObservableObject {
-    @Published var isLoading = false
-    @Published var error: AppError?
-    @Published var salaryConfig: SalaryConfig?
-    @Published var holidayConfigs: [HolidayConfig] = []
-    @Published var showOnboarding = false
-    
-    private(set) var salaryService: SalaryService?
-    private let userDefaults = UserDefaults.standard
-    private let hasSeenOnboardingKey = "hasSeenOnboarding"
-    
+/// 根视图：首次启动展示引导页，之后进入主界面。
+struct RootView: View {
+    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding = false
+
     init() {
-        showOnboarding = !userDefaults.bool(forKey: hasSeenOnboardingKey)
-    }
-    
-    // 初始化服务
-    func setupServices(context: ModelContext) {
-        let salaryRepo = SalaryConfigRepository(context: context)
-        let holidayRepo = HolidayConfigRepository(context: context)
-        salaryService = SalaryService(repository: salaryRepo, holidayRepository: holidayRepo)
-    }
-    
-    // 初始化应用
-    @MainActor
-    func initialize() async {
-        isLoading = true
-        defer { isLoading = false }
-        
-        do {
-            guard let service = salaryService else {
-                throw AppError.unknownError("服务未初始化")
-            }
-            
-            // 1. 加载工资配置
-            salaryConfig = try service.getCurrentConfig()
-            
-            // 2. 同步节假日数据
-            try await HolidayConfig.syncCurrentYearHolidays()
-            
-            // 3. 加载节假日配置
-            holidayConfigs = try service.holidayRepository.fetch()
-        } catch {
-            self.error = error as? AppError ?? AppError.unknownError(error.localizedDescription)
+        // UI 测试支持：传入 -resetOnboarding 时强制回到引导页
+        if CommandLine.arguments.contains("-resetOnboarding") {
+            UserDefaults.standard.set(false, forKey: "hasSeenOnboarding")
         }
     }
-    
-    // 更新工资配置
-    func updateSalaryConfig(_ config: SalaryConfig) {
-        do {
-            guard let service = salaryService else {
-                throw AppError.unknownError("服务未初始化")
-            }
-            
-            try service.updateConfig(config)
-            salaryConfig = config
-        } catch {
-            self.error = error as? AppError ?? AppError.unknownError(error.localizedDescription)
+
+    var body: some View {
+        if hasSeenOnboarding {
+            ContentView()
+        } else {
+            OnboardingView(isPresented: Binding(
+                get: { !hasSeenOnboarding },
+                set: { hasSeenOnboarding = !$0 }
+            ))
         }
-    }
-    
-    // 同步节假日数据
-    @MainActor
-    func syncHolidays() async {
-        isLoading = true
-        defer { isLoading = false }
-        
-        do {
-            try await HolidayConfig.syncCurrentYearHolidays()
-            guard let service = salaryService else {
-                throw AppError.unknownError("服务未初始化")
-            }
-            holidayConfigs = try service.holidayRepository.fetch()
-        } catch {
-            self.error = error as? AppError ?? AppError.unknownError(error.localizedDescription)
-        }
-    }
-    
-    // 计算月工资
-    func calculateMonthlySalary(year: Int, month: Int) -> Double? {
-        do {
-            guard let service = salaryService else {
-                throw AppError.unknownError("服务未初始化")
-            }
-            return try service.calculateMonthlySalary(year: year, month: month)
-        } catch {
-            self.error = error as? AppError ?? AppError.unknownError(error.localizedDescription)
-            return nil
-        }
-    }
-    
-    // 清除错误
-    func clearError() {
-        error = nil
-    }
-    
-    // 完成引导
-    func completeOnboarding() {
-        userDefaults.set(true, forKey: hasSeenOnboardingKey)
-        showOnboarding = false
     }
 }
 
+/// 主界面：实时工资 + 设置两个 Tab。
 struct ContentView: View {
-    @EnvironmentObject private var appState: AppState
-    
+    @Environment(\.modelContext) private var modelContext
+    @Query private var configs: [SalaryConfig]
+
     var body: some View {
-        Group {
-            if appState.showOnboarding {
-                OnboardingView(isPresented: $appState.showOnboarding)
-                    .onDisappear {
-                        appState.completeOnboarding()
-                    }
-            } else {
-                TabView {
-                    ConfigView()
-                        .tabItem {
-                            Label("设置", systemImage: "gear")
-                        }
-                    
-                    StatisticsView()
-                        .tabItem {
-                            Label("统计", systemImage: "chart.bar")
-                        }
+        TabView {
+            EarningsView()
+                .tabItem {
+                    Label("工资", systemImage: "dollarsign.circle.fill")
                 }
-                .overlay {
-                    if appState.isLoading {
-                        LoadingOverlay(message: "加载中...")
-                    }
+
+            ConfigView()
+                .tabItem {
+                    Label("设置", systemImage: "gear")
                 }
-                .alert(error: $appState.error) { error in
-                    Alert(
-                        title: Text("错误"),
-                        message: Text(error.localizedDescription),
-                        dismissButton: .default(Text("确定")) {
-                            appState.clearError()
-                        }
-                    )
-                }
+        }
+        .task {
+            // 确保始终存在一份配置（首次启动时创建默认配置）
+            if configs.isEmpty {
+                modelContext.insert(SalaryConfig())
+                try? modelContext.save()
             }
         }
     }
@@ -163,5 +63,5 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-        .environmentObject(AppState())
-} 
+        .modelContainer(for: [SalaryConfig.self, HolidayConfig.self], inMemory: true)
+}

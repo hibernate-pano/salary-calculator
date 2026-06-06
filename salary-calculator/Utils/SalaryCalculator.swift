@@ -1,257 +1,137 @@
 import Foundation
 
+/// 实时工资计算引擎。
+///
+/// V1 模型（极简、可解释）：
+/// - 工作日：在上班~下班之间按秒累计，扣除午休；下班后为当日满额。
+/// - 非工作日：今日收入为 0（不工作不计薪）。
+/// - 本月：今天之前已完成的工作日按日薪累计 + 今日实时。
+/// - 年度：已完成整月按月薪累计 + 本月实时。
+///
+/// `holidays` 为空时（V1 默认），工作日判断退化为"按星期几"。
 class SalaryCalculator {
     private let config: SalaryConfig
     private let holidays: [HolidayConfig]
-    private let optimizer = PerformanceOptimizer.shared
-    
+    private let calendar = Calendar.current
+
     init(config: SalaryConfig, holidays: [HolidayConfig] = []) {
         self.config = config
         self.holidays = holidays
     }
-    
-    // 计算今日收入
-    func calculateTodayEarnings() -> Double {
-        let startTime = Date()
-        let now = Date()
-        
-        // 检查今天是否是工作日
-        if !isWorkday(now) {
-            // 如果是节假日，计算节假日加班工资
-            return calculateHolidayOvertimeEarnings(for: now)
-        }
-        
-        // 计算正常工作时间的收入
-        let normalWorkTime = calculateTodayWorkTime()
-        let normalEarnings = normalWorkTime * config.salaryPerSecond
-        
-        // 计算加班时间的收入
-        let overtimeSeconds = config.calculateOvertimeSeconds(for: now)
-        let overtimeEarnings = overtimeSeconds * config.salaryPerSecond * config.overtimeRate
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "calculateTodayEarnings", duration: duration)
-        
-        return normalEarnings + overtimeEarnings
+
+    /// 判断某天是否为工作日。
+    func isWorkday(_ date: Date) -> Bool {
+        // 调休补班优先
+        if HolidayConfig.isWorkday(date, holidays: holidays) { return true }
+        // 法定节假日
+        if HolidayConfig.isHoliday(date, holidays: holidays) { return false }
+        // 常规工作日（按星期几）
+        let weekday = calendar.component(.weekday, from: date)
+        return config.workDays.contains(weekday)
     }
-    
-    // 计算本月收入
-    func calculateMonthEarnings() -> Double {
-        let startTime = Date()
-        let now = Date()
-        let calendar = Calendar.current
-        
-        // 获取本月的工作日数
+
+    /// 每秒工资。配置非法（无工作日 / 工作时长为 0）时返回 0，避免 NaN。
+    var salaryPerSecond: Double {
+        let value = config.salaryPerSecond
+        return value.isFinite ? max(0, value) : 0
+    }
+
+    /// 今日收入（实时）。
+    func todayEarnings(asOf now: Date = Date()) -> Double {
+        guard isWorkday(now) else { return 0 }
+        return workedSeconds(asOf: now) * salaryPerSecond
+    }
+
+    /// 当前所处的时段，用于界面展示准确的状态文案。
+    enum DayPhase {
+        case dayOff        // 休息日
+        case beforeWork    // 上班前
+        case working       // 工作中
+        case lunchBreak    // 午休中
+        case afterWork     // 已下班
+    }
+
+    /// 判断当前时段。
+    func phase(asOf now: Date = Date()) -> DayPhase {
+        guard isWorkday(now) else { return .dayOff }
+
+        let start = setTime(config.workStartTime, on: now)
+        let end = setTime(config.workEndTime, on: now)
+
+        if now < start { return .beforeWork }
+        if now >= end { return .afterWork }
+
+        if let lunchStartTime = config.lunchStartTime,
+           let lunchEndTime = config.lunchEndTime {
+            let lunchStart = setTime(lunchStartTime, on: now)
+            let lunchEnd = setTime(lunchEndTime, on: now)
+            if now >= lunchStart && now < lunchEnd { return .lunchBreak }
+        }
+
+        return .working
+    }
+
+    /// 今日已工作秒数：考虑上下班时间，扣除午休。
+    func workedSeconds(asOf now: Date = Date()) -> TimeInterval {        let start = setTime(config.workStartTime, on: now)
+        let end = setTime(config.workEndTime, on: now)
+        guard now > start else { return 0 }
+
+        let capped = min(now, end)
+        var seconds = capped.timeIntervalSince(start)
+
+        // 扣除已经过去的午休时间
+        if let lunchStartTime = config.lunchStartTime,
+           let lunchEndTime = config.lunchEndTime {
+            let lunchStart = setTime(lunchStartTime, on: now)
+            let lunchEnd = setTime(lunchEndTime, on: now)
+            if capped > lunchStart {
+                let overlapEnd = min(capped, lunchEnd)
+                seconds -= max(0, overlapEnd.timeIntervalSince(lunchStart))
+            }
+        }
+
+        return max(0, seconds)
+    }
+
+    /// 本月收入：已完成工作日 + 今日实时。
+    func monthEarnings(asOf now: Date = Date()) -> Double {
         let year = calendar.component(.year, from: now)
         let month = calendar.component(.month, from: now)
-        let workDaysInMonth = optimizer.workDaysInMonth(year: year, month: month, workDays: config.workDays)
-        
-        // 计算本月已工作天数
-        var workedDays = 0
         let today = calendar.component(.day, from: now)
-        
-        for day in 1...today {
-            if let date = calendar.date(from: DateComponents(year: year, month: month, day: day)) {
-                if isWorkday(date) {
-                    workedDays += 1
+
+        // 日薪 = 每秒工资 × 每日工作秒数（与实时计算同源，保证一致）
+        let dailySalary = salaryPerSecond * config.dailyWorkSeconds
+
+        // 统计今天之前已完成的工作日
+        var completedWorkdays = 0
+        if today > 1 {
+            for day in 1..<today {
+                if let date = calendar.date(from: DateComponents(year: year, month: month, day: day)),
+                   isWorkday(date) {
+                    completedWorkdays += 1
                 }
             }
         }
-        
-        // 计算本月收入
-        let dailySalary = config.monthlySalary / Double(workDaysInMonth)
-        let monthEarnings = dailySalary * Double(workedDays)
-        
-        // 加上今天的收入
-        let result = monthEarnings + calculateTodayEarnings()
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "calculateMonthEarnings", duration: duration)
-        
-        return result
+
+        return dailySalary * Double(completedWorkdays) + todayEarnings(asOf: now)
     }
-    
-    // 计算年度收入
-    func calculateYearEarnings() -> Double {
-        let startTime = Date()
-        let now = Date()
-        let calendar = Calendar.current
-        
-        // 获取今年的工作日数
-        let year = calendar.component(.year, from: now)
-        let workDaysInYear = optimizer.workDaysInYear(year: year, workDays: config.workDays)
-        
-        // 计算年度收入
-        let dailySalary = config.monthlySalary * 12 / Double(workDaysInYear)
-        let yearEarnings = dailySalary * Double(workDaysInYear)
-        
-        // 减去未工作月份的收入
-        let currentMonth = calendar.component(.month, from: now)
-        let remainingMonths = 12 - currentMonth
-        let remainingEarnings = config.monthlySalary * Double(remainingMonths)
-        
-        let result = yearEarnings - remainingEarnings + calculateMonthEarnings()
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "calculateYearEarnings", duration: duration)
-        
-        return result
+
+    /// 年度收入：已完成整月按月薪累计 + 本月实时。
+    func yearEarnings(asOf now: Date = Date()) -> Double {
+        let completedMonths = calendar.component(.month, from: now) - 1
+        return config.monthlySalary * Double(completedMonths) + monthEarnings(asOf: now)
     }
-    
-    // 计算今日工作时间（秒）
-    private func calculateTodayWorkTime() -> TimeInterval {
-        let startTime = Date()
-        let now = Date()
-        let calendar = Calendar.current
-        
-        // 获取今天的开始和结束时间
-        let today = calendar.startOfDay(for: now)
-        let workStart = calendar.date(bySettingHour: calendar.component(.hour, from: config.workStartTime),
-                                    minute: calendar.component(.minute, from: config.workStartTime),
-                                    second: 0,
-                                    of: today)!
-        let workEnd = calendar.date(bySettingHour: calendar.component(.hour, from: config.workEndTime),
-                                  minute: calendar.component(.minute, from: config.workEndTime),
-                                  second: 0,
-                                  of: today)!
-        
-        // 如果现在在工作时间之前，返回0
-        if now < workStart {
-            return 0
-        }
-        
-        // 如果现在在工作时间之后，返回总工作时间
-        if now > workEnd {
-            return config.dailyWorkSeconds
-        }
-        
-        // 计算已工作时间
-        var workTime = now.timeIntervalSince(workStart)
-        
-        // 如果有午休时间，需要减去午休时间
-        if let lunchStart = config.lunchStartTime,
-           let lunchEnd = config.lunchEndTime {
-            let lunchStartToday = calendar.date(bySettingHour: calendar.component(.hour, from: lunchStart),
-                                              minute: calendar.component(.minute, from: lunchStart),
-                                              second: 0,
-                                              of: today)!
-            let lunchEndToday = calendar.date(bySettingHour: calendar.component(.hour, from: lunchEnd),
-                                            minute: calendar.component(.minute, from: lunchEnd),
-                                            second: 0,
-                                            of: today)!
-            
-            // 如果现在在午休时间，返回午休前的工作时间
-            if now >= lunchStartToday && now <= lunchEndToday {
-                workTime = lunchStartToday.timeIntervalSince(workStart)
-            }
-            // 如果现在在午休后，需要减去午休时间
-            else if now > lunchEndToday {
-                workTime -= lunchEndToday.timeIntervalSince(lunchStartToday)
-            }
-        }
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "calculateTodayWorkTime", duration: duration)
-        
-        return workTime
+
+    // MARK: - Helpers
+
+    /// 把"只含时分"的时间映射到指定日期当天。
+    private func setTime(_ time: Date, on day: Date) -> Date {
+        let comps = calendar.dateComponents([.hour, .minute], from: time)
+        return calendar.date(
+            bySettingHour: comps.hour ?? 0,
+            minute: comps.minute ?? 0,
+            second: 0,
+            of: calendar.startOfDay(for: day)
+        ) ?? day
     }
-    
-    // 判断指定日期是否为工作日
-    private func isWorkday(_ date: Date) -> Bool {
-        let startTime = Date()
-        let calendar = Calendar.current
-        let weekday = calendar.component(.weekday, from: date)
-        
-        // 检查是否是配置的工作日
-        if config.workDays.contains(weekday) {
-            // 检查是否是节假日
-            if HolidayConfig.isHoliday(date, holidays: holidays) {
-                return false
-            }
-            return true
-        }
-        
-        // 检查是否是调休工作日
-        let result = HolidayConfig.isWorkday(date, holidays: holidays)
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "isWorkday", duration: duration)
-        
-        return result
-    }
-    
-    // 计算节假日加班收入
-    private func calculateHolidayOvertimeEarnings(for date: Date) -> Double {
-        let overtimeSeconds = config.calculateHolidayOvertimeSeconds(for: date)
-        return overtimeSeconds * config.salaryPerSecond * config.holidayOvertimeRate
-    }
-    
-    // 计算跨月工资
-    func calculateCrossMonthEarnings(from startDate: Date, to endDate: Date) -> Double {
-        let startTime = Date()
-        let calendar = Calendar.current
-        var totalEarnings: Double = 0
-        
-        // 获取日期范围内的所有日期
-        var currentDate = startDate
-        while currentDate <= endDate {
-            if isWorkday(currentDate) {
-                // 计算正常工作时间的收入
-                let normalWorkTime = calculateWorkTime(for: currentDate)
-                let normalEarnings = normalWorkTime * config.salaryPerSecond
-                
-                // 计算加班时间的收入
-                let overtimeSeconds = config.calculateOvertimeSeconds(for: currentDate)
-                let overtimeEarnings = overtimeSeconds * config.salaryPerSecond * config.overtimeRate
-                
-                totalEarnings += normalEarnings + overtimeEarnings
-            } else {
-                // 计算节假日加班收入
-                totalEarnings += calculateHolidayOvertimeEarnings(for: currentDate)
-            }
-            
-            // 移动到下一天
-            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
-        }
-        
-        // 记录性能
-        let duration = Date().timeIntervalSince(startTime)
-        optimizer.trackPerformance(for: "calculateCrossMonthEarnings", duration: duration)
-        
-        return totalEarnings
-    }
-    
-    // 计算指定日期的工作时间（秒）
-    private func calculateWorkTime(for date: Date) -> TimeInterval {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: date)
-        
-        // 获取工作开始和结束时间
-        let workStart = calendar.date(bySettingHour: calendar.component(.hour, from: config.workStartTime),
-                                    minute: calendar.component(.minute, from: config.workStartTime),
-                                    second: 0,
-                                    of: today)!
-        let workEnd = calendar.date(bySettingHour: calendar.component(.hour, from: config.workEndTime),
-                                  minute: calendar.component(.minute, from: config.workEndTime),
-                                  second: 0,
-                                  of: today)!
-        
-        // 如果是过去的工作日，返回全天工作时间
-        if date < Date() {
-            return config.dailyWorkSeconds
-        }
-        
-        // 如果是今天，返回已工作时间
-        if calendar.isDateInToday(date) {
-            return calculateTodayWorkTime()
-        }
-        
-        // 如果是未来的工作日，返回0
-        return 0
-    }
-} 
+}
